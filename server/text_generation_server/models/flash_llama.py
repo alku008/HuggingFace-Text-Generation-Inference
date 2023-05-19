@@ -148,7 +148,7 @@ tracer = trace.get_tracer(__name__)
 
 
 class Weights:
-    def __init__(self, filenames: List[Path], device, dtype):
+    def __init__(self, filenames: List[Path], device, dtype, process_group):
         routing = {}
         for filename in filenames:
             with safe_open(filename, framework="pytorch") as f:
@@ -161,12 +161,50 @@ class Weights:
         self.routing = routing
         self.device = device
         self.dtype = dtype
+        self.process_group = process_group
 
-    def get(self, name: str):
-        filename = self.routing.get(name, None)
+
+    def get_filename(self, tensor_name: str) -> str:
+        filename = self.routing.get(tensor_name, None)
         if filename is None:
-            raise RuntimeError(f"weight {name} does not exist")
+            raise RuntimeError(f"weight {tensor_name} does not exist")
         return filename
+
+    def get_shape(self, tensor_name: str):
+        filename = self.get_filename(tensor_name)
+        with safe_open(filename, framework="pytorch") as f:
+            slice_ = f.get_slice(tensor_name)
+            return slice_.get_shape()
+
+    def get_tensor(self, tensor_name: str):
+        filename = self.get_filename(tensor_name)
+        with safe_open(filename, framework="pytorch") as f:
+            tensor = f.get_tensor(tensor_name)
+        tensor = tensor.to(dtype=self.dtype)
+        tensor = tensor.to(device=self.device)
+        return tensor
+
+    def get_sharded(self, tensor_name: str, dim: int):
+        filename = self.get_filename(tensor_name)
+        world_size = self.process_group.size()
+        rank = self.process_group.rank()
+
+        with safe_open(filename, framework="pytorch") as f:
+            slice_ = f.get_slice(tensor_name)
+            size = slice_.get_shape()[dim]
+            block_size = size // world_size
+            start = rank * block_size
+            stop = (rank + 1) * block_size
+
+            if dim == 0:
+                tensor = slice_[start:stop]
+            elif dim == 1:
+                tensor = slice_[:, start:stop]
+            else:
+                raise NotImplementedError("Let's make that generic when needed")
+        tensor = tensor.to(dtype=self.dtype)
+        tensor = tensor.to(device=self.device)
+        return tensor
 
 
 class FlashLlama(FlashLlamaForCausalLM):
@@ -198,7 +236,7 @@ class FlashLlama(FlashLlamaForCausalLM):
         torch.distributed.barrier(group=self.process_group)
 
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(filenames, device, dtype)
+        weights = Weights(filenames, device, dtype, process_group=self.process_group)
 
         config.quantize = quantize
         model = FlashLlamaForCausalLM(config, weights, process_group=self.process_group)
@@ -224,113 +262,113 @@ class FlashLlama(FlashLlamaForCausalLM):
             world_size=world_size,
         )
 
-    @staticmethod
-    def load_weights(
-        model,
-        filenames: List[str],
-        quantize: Optional[str],
-        device: torch.device,
-        dtype: torch.dtype,
-        rank: int,
-        world_size: int,
-    ):
-        for file in filenames:
-            with safe_open(
-                file, framework="pt", device=str(device) if quantize is None else "cpu"
-            ) as f:
-                for name in f.keys():
-                    slice_ = f.get_slice(name)
+    # @staticmethod
+    # def load_weights(
+    #     model,
+    #     filenames: List[str],
+    #     quantize: Optional[str],
+    #     device: torch.device,
+    #     dtype: torch.dtype,
+    #     rank: int,
+    #     world_size: int,
+    # ):
+    #     for file in filenames:
+    #         with safe_open(
+    #             file, framework="pt", device=str(device) if quantize is None else "cpu"
+    #         ) as f:
+    #             for name in f.keys():
+    #                 slice_ = f.get_slice(name)
 
-                    layer_name = ".".join(name.split(".")[:4])
+    #                 layer_name = ".".join(name.split(".")[:4])
 
-                    # Fused qkv
-                    if "q_proj" in name or "k_proj" in name or "v_proj" in name:
-                        final_name = layer_name + ".query_key_value.weight"
+    #                 # Fused qkv
+    #                 if "q_proj" in name or "k_proj" in name or "v_proj" in name:
+    #                     final_name = layer_name + ".query_key_value.weight"
 
-                    # Fused gate and up projs
-                    elif "gate_proj" in name or "up_proj" in name:
-                        final_name = layer_name + ".gate_up_proj.weight"
-                    else:
-                        final_name = name
+    #                 # Fused gate and up projs
+    #                 elif "gate_proj" in name or "up_proj" in name:
+    #                     final_name = layer_name + ".gate_up_proj.weight"
+    #                 else:
+    #                     final_name = name
 
-                    module_name, param_name = final_name.rsplit(".", 1)
-                    module = model.get_submodule(module_name)
+    #                 module_name, param_name = final_name.rsplit(".", 1)
+    #                 module = model.get_submodule(module_name)
 
-                    if isinstance(module, TensorParallelColumnLinear):
-                        size = slice_.get_shape()[0]
-                        block_size = size // world_size
-                        start = rank * block_size
-                        stop = (rank + 1) * block_size
-                        tensor = slice_[start:stop]
-                    elif isinstance(module, TensorParallelRowLinear):
-                        size = slice_.get_shape()[1]
-                        block_size = size // world_size
-                        start = rank * block_size
-                        stop = (rank + 1) * block_size
-                        tensor = slice_[:, start:stop]
-                    elif isinstance(module, TensorParallelEmbedding):
-                        size = slice_.get_shape()[0]
-                        block_size = size // world_size
-                        start = rank * block_size
-                        stop = (rank + 1) * block_size
-                        tensor = slice_[start:stop]
-                    elif name == "lm_head.weight" and model.model.tp_embeddings:
-                        size = slice_.get_shape()[0]
-                        block_size = size // world_size
-                        start = rank * block_size
-                        stop = (rank + 1) * block_size
-                        tensor = slice_[start:stop]
-                    else:
-                        try:
-                            tensor = slice_[:]
-                        except:
-                            tensor = f.get_tensor(name)
+    #                 if isinstance(module, TensorParallelColumnLinear):
+    #                     size = slice_.get_shape()[0]
+    #                     block_size = size // world_size
+    #                     start = rank * block_size
+    #                     stop = (rank + 1) * block_size
+    #                     tensor = slice_[start:stop]
+    #                 elif isinstance(module, TensorParallelRowLinear):
+    #                     size = slice_.get_shape()[1]
+    #                     block_size = size // world_size
+    #                     start = rank * block_size
+    #                     stop = (rank + 1) * block_size
+    #                     tensor = slice_[:, start:stop]
+    #                 elif isinstance(module, TensorParallelEmbedding):
+    #                     size = slice_.get_shape()[0]
+    #                     block_size = size // world_size
+    #                     start = rank * block_size
+    #                     stop = (rank + 1) * block_size
+    #                     tensor = slice_[start:stop]
+    #                 elif name == "lm_head.weight" and model.model.tp_embeddings:
+    #                     size = slice_.get_shape()[0]
+    #                     block_size = size // world_size
+    #                     start = rank * block_size
+    #                     stop = (rank + 1) * block_size
+    #                     tensor = slice_[start:stop]
+    #                 else:
+    #                     try:
+    #                         tensor = slice_[:]
+    #                     except:
+    #                         tensor = f.get_tensor(name)
 
-                    tensor = tensor.contiguous().to(dtype)
+    #                 tensor = tensor.contiguous().to(dtype)
 
-                    try:
-                        current_parameter_tensor = module._parameters[param_name]
-                    except KeyError:
-                        current_parameter_tensor = None
+    #                 try:
+    #                     current_parameter_tensor = module._parameters[param_name]
+    #                 except KeyError:
+    #                     current_parameter_tensor = None
 
-                    if current_parameter_tensor is not None:
-                        if current_parameter_tensor.device == torch.device("meta"):
-                            # Init qkv
-                            if "query_key_value" in final_name:
-                                module._parameters[param_name] = tensor.new_empty(
-                                    (tensor.shape[0] * 3, tensor.shape[1])
-                                )
-                            # Init gate and up proj
-                            elif "gate_up_proj" in final_name:
-                                module._parameters[param_name] = tensor.new_empty(
-                                    (tensor.shape[0] * 2, tensor.shape[1])
-                                )
+    #                 if current_parameter_tensor is not None:
+    #                     if current_parameter_tensor.device == torch.device("meta"):
+    #                         # Init qkv
+    #                         if "query_key_value" in final_name:
+    #                             module._parameters[param_name] = tensor.new_empty(
+    #                                 (tensor.shape[0] * 3, tensor.shape[1])
+    #                             )
+    #                         # Init gate and up proj
+    #                         elif "gate_up_proj" in final_name:
+    #                             module._parameters[param_name] = tensor.new_empty(
+    #                                 (tensor.shape[0] * 2, tensor.shape[1])
+    #                             )
 
-                        # Init gate and up proj
-                        if "q_proj" in name:
-                            module._parameters[param_name][: tensor.shape[0]] = tensor
-                        elif "k_proj" in name:
-                            module._parameters[param_name][
-                                tensor.shape[0] : tensor.shape[0] * 2
-                            ] = tensor
-                        elif "v_proj" in name:
-                            module._parameters[param_name][
-                                tensor.shape[0] * 2 :
-                            ] = tensor
-                        elif "gate_proj" in name:
-                            module._parameters[param_name][: tensor.shape[0]] = tensor
-                        elif "up_proj" in name:
-                            module._parameters[param_name][tensor.shape[0] :] = tensor
-                        else:
-                            if current_parameter_tensor.shape != tensor.shape:
-                                raise ValueError(
-                                    f"Name {name} -- Current {current_parameter_tensor.shape} and got {tensor.shape}"
-                                )
+    #                     # Init gate and up proj
+    #                     if "q_proj" in name:
+    #                         module._parameters[param_name][: tensor.shape[0]] = tensor
+    #                     elif "k_proj" in name:
+    #                         module._parameters[param_name][
+    #                             tensor.shape[0] : tensor.shape[0] * 2
+    #                         ] = tensor
+    #                     elif "v_proj" in name:
+    #                         module._parameters[param_name][
+    #                             tensor.shape[0] * 2 :
+    #                         ] = tensor
+    #                     elif "gate_proj" in name:
+    #                         module._parameters[param_name][: tensor.shape[0]] = tensor
+    #                     elif "up_proj" in name:
+    #                         module._parameters[param_name][tensor.shape[0] :] = tensor
+    #                     else:
+    #                         if current_parameter_tensor.shape != tensor.shape:
+    #                             raise ValueError(
+    #                                 f"Name {name} -- Current {current_parameter_tensor.shape} and got {tensor.shape}"
+    #                             )
 
-                            module._parameters[param_name] = tensor
+    #                         module._parameters[param_name] = tensor
 
-                    else:
-                        module._buffers[param_name] = tensor
+    #                 else:
+    #                     module._buffers[param_name] = tensor
 
-        torch.cuda.empty_cache()
-        model.post_load_weights(quantize)
+    #     torch.cuda.empty_cache()
+    #     model.post_load_weights(quantize)

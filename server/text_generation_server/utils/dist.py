@@ -3,9 +3,20 @@ import torch
 
 from datetime import timedelta
 
+class FakeBarrier:
+    def wait(self):
+        pass
+
 
 class FakeGroup:
-    pass
+    def barrier(self, *args, **kwargs):
+        return FakeBarrier()
+
+    def size(self):
+        return 1
+
+    def rank(self):
+        return 0
 
 
 def initialize_torch_distributed():

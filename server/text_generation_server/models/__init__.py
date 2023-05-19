@@ -32,7 +32,6 @@ try:
         from text_generation_server.models.flash_neox import FlashNeoX, FlashNeoXSharded
         from text_generation_server.models.flash_llama import (
             FlashLlama,
-            FlashLlamaSharded,
         )
         from text_generation_server.models.flash_santacoder import (
             FlashSantacoder,
@@ -71,7 +70,6 @@ if FLASH_ATTENTION:
     __all__.append(FlashSantacoder)
     __all__.append(FlashSantacoderSharded)
     __all__.append(FlashLlama)
-    __all__.append(FlashLlamaSharded)
 
 FLASH_ATT_ERROR_MESSAGE = (
     "{} requires Flash Attention CUDA kernels to be installed.\n"
@@ -141,7 +139,7 @@ def get_model(
     if model_type == "llama":
         if sharded:
             if FLASH_ATTENTION:
-                return FlashLlamaSharded(model_id, revision, quantize=quantize)
+                return FlashLlama(model_id, revision, quantize=quantize)
             raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Llama"))
         else:
             llama_cls = FlashLlama if FLASH_ATTENTION else CausalLM

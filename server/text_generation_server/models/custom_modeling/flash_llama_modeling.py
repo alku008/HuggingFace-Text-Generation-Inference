@@ -40,12 +40,15 @@ from text_generation_server.utils.layers import (
 
 
 class LlamaRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, prefix, weights, eps=1e-6):
         """
         LlamaRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+        weight = weights.get_tensor(f"{prefix}.weight")
+        # assert weight.shape == (hidden_size,)
+        self.weight = nn.Parameter(weight)
         self.variance_epsilon = eps
 
     def forward(self, hidden_states, residual=None):
@@ -92,35 +95,31 @@ class LlamaRMSNorm(nn.Module):
 class FlashLlamaAttention(torch.nn.Module):
     def __init__(
         self,
-        num_heads,
-        hidden_size,
-        process_group=None,
+        prefix: str,
+        config,
+        weights,
     ):
         super().__init__()
-        self.num_heads = num_heads
-        self.hidden_size = hidden_size
-        self.head_size = hidden_size // num_heads
+        self.num_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_size = self.hidden_size // self.num_heads
 
         self.rotary_emb = PositionRotaryEmbedding(self.head_size, base=10000)
         self.softmax_scale = self.head_size ** (-0.5)
 
-        if process_group is None:
-            self.query_key_value = FastLinear(hidden_size, 3 * hidden_size, bias=False)
-            self.o_proj = FastLinear(hidden_size, hidden_size, bias=False)
-        else:
-            self.num_heads = self.num_heads // process_group.size()
-            self.query_key_value = TensorParallelColumnLinear(
-                hidden_size,
-                3 * hidden_size,
-                bias=False,
-                process_group=process_group,
-            )
-            self.o_proj = TensorParallelRowLinear(
-                hidden_size,
-                hidden_size,
-                bias=False,
-                process_group=process_group,
-            )
+        self.num_heads = self.num_heads // weights.process_group.size()
+        self.query_key_value = TensorParallelColumnLinear.load_multi(
+            prefixes=[f"{prefix}.q_proj",
+            f"{prefix}.k_proj",
+            f"{prefix}.v_proj"],
+            dim=0,
+            weights=weights,
+            bias=False,
+        )
+        self.o_proj = TensorParallelRowLinear.load(
+            prefix=f"{prefix}.o_proj", weights=weights,
+            bias=False,
+        )
 
     def forward(
         self,
@@ -193,44 +192,33 @@ class FlashLlamaAttention(torch.nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    # def __init__(self, act, hidden_size, intermediate_size, process_group=None):
-    #     super().__init__()
-    #     self.act = (
-    #         ACT2FN[act]
-    #         if "gelu" not in act
-    #         else lambda x: torch.nn.functional.gelu(
-    #             x,
-    #             approximate="tanh"
-    #             if act in ["gelu_fast", "gelu_pytorch_tanh"]
-    #             else "none",
-    #         )
-    #     )
-
-    #     if process_group is None:
-    #         # Fuse gate and up proj
-    #         self.gate_up_proj = FastLinear(
-    #             hidden_size, 2 * intermediate_size, bias=False
-    #         )
-    #         self.down_proj = FastLinear(intermediate_size, hidden_size, bias=False)
-    #         self.intermediate_size = intermediate_size
-    #     else:
-    #         # Fuse gate and up proj
-    #         self.gate_up_proj = TensorParallelColumnLinear(
-    #             hidden_size,
-    #             2 * intermediate_size,
-    #             bias=False,
-    #             process_group=process_group,
-    #         )
-    #         self.down_proj = TensorParallelRowLinear(
-    #             intermediate_size,
-    #             hidden_size,
-    #             bias=False,
-    #             process_group=process_group,
-    #             reduce=True,
-    #         )
-    #         self.intermediate_size = self.down_proj.in_features
-
-    #     self.process_group = process_group
+    def __init__(self, prefix, config, weights):
+        super().__init__()
+        act = config.hidden_act
+        self.act = (
+            ACT2FN[act]
+            if "gelu" not in act
+            else lambda x: torch.nn.functional.gelu(
+                x,
+                approximate="tanh"
+                if act in ["gelu_fast", "gelu_pytorch_tanh"]
+                else "none",
+            )
+        )
+        # Fuse gate and up proj
+        self.gate_up_proj = TensorParallelColumnLinear.load_multi(
+            prefixes=[f"{prefix}.gate_proj", f"{prefix}.up_proj"],
+            weights=weights,
+            dim=0,
+            bias=False,
+        )
+        self.down_proj = TensorParallelRowLinear.load(
+            prefix=f"{prefix}.down_proj",
+            weights=weights,
+            bias=False,
+        )
+        # TODO is this correct? It should give both are controlled by the same param
+        self.intermediate_size = self.gate_up_proj.weight.shape[1] // 2
 
     def forward(self, hidden_states):
         gate_up_states = self.gate_up_proj(hidden_states)
@@ -239,22 +227,14 @@ class LlamaMLP(nn.Module):
 
 
 class FlashLlamaLayer(nn.Module):
-    def __init__(
-        self,
-        num_heads,
-        act,
-        hidden_size,
-        intermediate_size,
-        rms_norm_eps,
-        process_group=None,
-    ):
+    def __init__(self, layer_id, config, weights):
         super().__init__()
+        prefix = f"model.layers.{layer_id}"
+        self.self_attn = FlashLlamaAttention(prefix=f"{prefix}.self_attn", config=config, weights=weights)
+        self.mlp = LlamaMLP(prefix=f"{prefix}.mlp", config=config, weights=weights)
 
-        self.self_attn = FlashLlamaAttention(num_heads, hidden_size, process_group)
-        self.mlp = LlamaMLP(act, hidden_size, intermediate_size, process_group)
-
-        self.input_layernorm = LlamaRMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(prefix=f"{prefix}.input_layernorm", weights=weights, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(prefix=f"{prefix}.post_attention_layernorm", weights=weights, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -293,38 +273,39 @@ class FlashLlamaLayer(nn.Module):
 
 
 class FlashLlamaModel(torch.nn.Module):
-    def __init__(self, config, process_group=None):
-        super(FlashLlamaModel, self).__init__()
+    def __init__(self, config, weights, process_group):
+        super().__init__()
         self.config = config
 
         self.tp_embeddings = False
-        if process_group is not None:
-            self.tp_rank = process_group.rank()
-            self.tp_world_size = process_group.size()
-            if config.vocab_size % self.tp_world_size == 0:
-                self.tp_embeddings = True
+        self.tp_rank = process_group.rank()
+        self.tp_world_size = process_group.size()
+        if config.vocab_size % self.tp_world_size == 0:
+            self.tp_embeddings = True
 
         if self.tp_embeddings:
             self.embed_tokens = TensorParallelEmbedding(
-                config.vocab_size, config.hidden_size, process_group=process_group
+                prefix="model.embed_tokens", weights=weights
             )
         else:
-            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.embed_tokens = Embedding(prefix="model.embed_tokens", process_group=process_group)
 
         self.layers = nn.ModuleList(
             [
                 FlashLlamaLayer(
-                    config.num_attention_heads,
-                    config.hidden_act,
-                    config.hidden_size,
-                    config.intermediate_size,
-                    config.rms_norm_eps,
-                    process_group,
+                    # config.num_attention_heads,
+                    # config.hidden_act,
+                    # config.hidden_size,
+                    # config.intermediate_size,
+                    layer_id,
+                    config,
+                    weights,
+                    # config.rms_norm_eps,
                 )
-                for _ in range(config.num_hidden_layers)
+                for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = LlamaRMSNorm(prefix="model", weights=weights, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
 
