@@ -316,16 +316,6 @@ class FlashLlamaModel(torch.nn.Module):
         self.head_size = self.layers[0].self_attn.head_size
         self.num_heads = self.layers[0].self_attn.num_heads
 
-    # def post_load_weights(self, quantize: Optional[str] = None):
-    #     if isinstance(self.embed_tokens, TensorParallelEmbedding):
-    #         self.embed_tokens.add_null_idx()
-    #     for layer in self.layers:
-    #         layer: FlashLlamaLayer
-    #         layer.self_attn.query_key_value.prepare_weights(quantize)
-    #         layer.self_attn.o_proj.prepare_weights(quantize)
-    #         layer.mlp.gate_up_proj.prepare_weights(quantize)
-    #         layer.mlp.down_proj.prepare_weights(quantize)
-
     def forward(
         self,
         input_ids,
