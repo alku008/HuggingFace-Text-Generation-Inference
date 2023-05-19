@@ -65,6 +65,28 @@ class FastLinear(nn.Linear):
             return torch.matmul(input, self.weight)
 
 
+class TensorParallelHead(FastLinear):
+    @staticmethod
+    def load(
+        *,
+        prefix: str,
+        weights,
+        process_group,
+        bias: bool,
+    ):
+        super().__init__(in_features, out_features)
+        self.world_size = process_group.world_size
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        output = super().forward(input)
+        # Logits are sharded, so we need to gather them
+        world_output = [torch.empty_like(output) for _ in range(self.world_size)]
+        torch.distributed.all_gather(world_output, output, group=self.process_group)
+        world_output = torch.cat(world_output, dim=1)
+
+        return world_output
+
+
 class TensorParallelColumnLinear(FastLinear):
     def __init__(
         self,

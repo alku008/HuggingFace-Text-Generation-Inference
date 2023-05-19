@@ -4,6 +4,10 @@ import torch
 from datetime import timedelta
 
 
+class FakeGroup:
+    pass
+
+
 def initialize_torch_distributed():
     rank = int(os.getenv("RANK", "0"))
     world_size = int(os.getenv("WORLD_SIZE", "1"))
@@ -23,13 +27,16 @@ def initialize_torch_distributed():
         backend = "gloo"
         options = None
 
-    # Call the init process.
-    torch.distributed.init_process_group(
-        backend=backend,
-        world_size=world_size,
-        rank=rank,
-        timeout=timedelta(seconds=60),
-        pg_options=options,
-    )
+    if world_size == 1:
+        return FakeGroup(), rank, world_size
+    else:
+        # Call the init process.
+        torch.distributed.init_process_group(
+            backend=backend,
+            world_size=world_size,
+            rank=rank,
+            timeout=timedelta(seconds=60),
+            pg_options=options,
+        )
 
-    return torch.distributed.group.WORLD, rank, world_size
+        return torch.distributed.group.WORLD, rank, world_size

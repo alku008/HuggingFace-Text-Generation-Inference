@@ -35,6 +35,7 @@ from text_generation_server.utils.layers import (
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
     PositionRotaryEmbedding,
+    TensorParallelHead,
 )
 
 
@@ -192,44 +193,44 @@ class FlashLlamaAttention(torch.nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, act, hidden_size, intermediate_size, process_group=None):
-        super().__init__()
-        self.act = (
-            ACT2FN[act]
-            if "gelu" not in act
-            else lambda x: torch.nn.functional.gelu(
-                x,
-                approximate="tanh"
-                if act in ["gelu_fast", "gelu_pytorch_tanh"]
-                else "none",
-            )
-        )
+    # def __init__(self, act, hidden_size, intermediate_size, process_group=None):
+    #     super().__init__()
+    #     self.act = (
+    #         ACT2FN[act]
+    #         if "gelu" not in act
+    #         else lambda x: torch.nn.functional.gelu(
+    #             x,
+    #             approximate="tanh"
+    #             if act in ["gelu_fast", "gelu_pytorch_tanh"]
+    #             else "none",
+    #         )
+    #     )
 
-        if process_group is None:
-            # Fuse gate and up proj
-            self.gate_up_proj = FastLinear(
-                hidden_size, 2 * intermediate_size, bias=False
-            )
-            self.down_proj = FastLinear(intermediate_size, hidden_size, bias=False)
-            self.intermediate_size = intermediate_size
-        else:
-            # Fuse gate and up proj
-            self.gate_up_proj = TensorParallelColumnLinear(
-                hidden_size,
-                2 * intermediate_size,
-                bias=False,
-                process_group=process_group,
-            )
-            self.down_proj = TensorParallelRowLinear(
-                intermediate_size,
-                hidden_size,
-                bias=False,
-                process_group=process_group,
-                reduce=True,
-            )
-            self.intermediate_size = self.down_proj.in_features
+    #     if process_group is None:
+    #         # Fuse gate and up proj
+    #         self.gate_up_proj = FastLinear(
+    #             hidden_size, 2 * intermediate_size, bias=False
+    #         )
+    #         self.down_proj = FastLinear(intermediate_size, hidden_size, bias=False)
+    #         self.intermediate_size = intermediate_size
+    #     else:
+    #         # Fuse gate and up proj
+    #         self.gate_up_proj = TensorParallelColumnLinear(
+    #             hidden_size,
+    #             2 * intermediate_size,
+    #             bias=False,
+    #             process_group=process_group,
+    #         )
+    #         self.down_proj = TensorParallelRowLinear(
+    #             intermediate_size,
+    #             hidden_size,
+    #             bias=False,
+    #             process_group=process_group,
+    #             reduce=True,
+    #         )
+    #         self.intermediate_size = self.down_proj.in_features
 
-        self.process_group = process_group
+    #     self.process_group = process_group
 
     def forward(self, hidden_states):
         gate_up_states = self.gate_up_proj(hidden_states)
@@ -330,15 +331,15 @@ class FlashLlamaModel(torch.nn.Module):
         self.head_size = self.layers[0].self_attn.head_size
         self.num_heads = self.layers[0].self_attn.num_heads
 
-    def post_load_weights(self, quantize: Optional[str] = None):
-        if isinstance(self.embed_tokens, TensorParallelEmbedding):
-            self.embed_tokens.add_null_idx()
-        for layer in self.layers:
-            layer: FlashLlamaLayer
-            layer.self_attn.query_key_value.prepare_weights(quantize)
-            layer.self_attn.o_proj.prepare_weights(quantize)
-            layer.mlp.gate_up_proj.prepare_weights(quantize)
-            layer.mlp.down_proj.prepare_weights(quantize)
+    # def post_load_weights(self, quantize: Optional[str] = None):
+    #     if isinstance(self.embed_tokens, TensorParallelEmbedding):
+    #         self.embed_tokens.add_null_idx()
+    #     for layer in self.layers:
+    #         layer: FlashLlamaLayer
+    #         layer.self_attn.query_key_value.prepare_weights(quantize)
+    #         layer.self_attn.o_proj.prepare_weights(quantize)
+    #         layer.mlp.gate_up_proj.prepare_weights(quantize)
+    #         layer.mlp.down_proj.prepare_weights(quantize)
 
     def forward(
         self,
@@ -407,29 +408,26 @@ class FlashLlamaModel(torch.nn.Module):
 
 
 class FlashLlamaForCausalLM(torch.nn.Module):
-    def __init__(self, config, process_group=None):
+    def __init__(self, config, weights, process_group):
         super().__init__()
 
         self.process_group = process_group
-        if self.process_group is not None:
-            self.world_size = self.process_group.size()
-        else:
-            self.world_size = 1
-
-        self.model = FlashLlamaModel(config, process_group)
+        self.world_size = self.process_group.size()
+        self.model = FlashLlamaModel(config, weights, process_group)
 
         if self.model.tp_embeddings:
-            self.lm_head = FastLinear(
-                config.hidden_size,
-                config.vocab_size // process_group.size(),
+            self.lm_head = TensorParallelHead.load(
+                prefix="lm_head",
+                weights=weights,
+                process_group=process_group,
                 bias=False,
             )
         else:
-            self.lm_head = FastLinear(config.hidden_size, config.vocab_size, bias=False)
-
-    def post_load_weights(self, quantize: Optional[str] = None):
-        self.model.post_load_weights(quantize)
-        self.lm_head.prepare_weights()
+            self.lm_head = FastLinear.load(
+                prefix="lm_head",
+                weights=weights,
+                bias=False,
+            )
 
     def forward(
         self,
@@ -451,12 +449,4 @@ class FlashLlamaForCausalLM(torch.nn.Module):
             pre_allocate_past_size,
         )
         logits = self.lm_head(hidden_states)
-
-        if self.model.tp_embeddings:
-            # Logits are sharded, so we need to gather them
-            world_logits = [torch.empty_like(logits) for _ in range(self.world_size)]
-            torch.distributed.all_gather(world_logits, logits, group=self.process_group)
-            world_logits = torch.cat(world_logits, dim=1)
-
-            return world_logits, present
         return logits, present

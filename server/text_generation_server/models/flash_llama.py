@@ -27,127 +27,149 @@ from text_generation_server.utils import (
 tracer = trace.get_tracer(__name__)
 
 
-class FlashLlama(FlashCausalLM):
-    def __init__(
-        self,
-        model_id: str,
-        revision: Optional[str] = None,
-        quantize: Optional[str] = None,
-    ):
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-            dtype = torch.float16
-        else:
-            raise NotImplementedError("FlashLlama is only available on GPU")
+# class FlashLlama(FlashCausalLM):
+#     def __init__(
+#         self,
+#         model_id: str,
+#         revision: Optional[str] = None,
+#         quantize: Optional[str] = None,
+#     ):
+#         if torch.cuda.is_available():
+#             device = torch.device("cuda")
+#             dtype = torch.float16
+#         else:
+#             raise NotImplementedError("FlashLlama is only available on GPU")
+#
+#         tokenizer = LlamaTokenizer.from_pretrained(
+#             model_id,
+#             revision=revision,
+#             padding_side="left",
+#             truncation_side="left",
+#         )
+#
+#         config = AutoConfig.from_pretrained(
+#             model_id,
+#             revision=revision,
+#         )
+#
+#         # We do not use from_pretrained as we modified the model internal module layout
+#         try:
+#             filenames = weight_files(model_id, revision, ".bin")
+#         # Local files not found
+#         except LocalEntryNotFoundError:
+#             hub_files = weight_hub_files(model_id, revision, ".bin")
+#             filenames = download_weights(hub_files, model_id, revision)
+#
+#         with init_empty_weights():
+#             model = FlashLlamaForCausalLM(config)
+#
+#         self.load_weights(model, filenames, quantize, device, dtype)
+#
+#         super(FlashCausalLM, self).__init__(
+#             model=model.to(device),
+#             tokenizer=tokenizer,
+#             requires_padding=False,
+#             dtype=dtype,
+#             device=device,
+#         )
+#
+#     @staticmethod
+#     def load_weights(
+#         model,
+#         filenames: List[Path],
+#         quantize: Optional[str],
+#         device: torch.device,
+#         dtype: torch.dtype,
+#     ):
+#         for filename in filenames:
+#             state_dict = torch.load(filename, map_location="cpu")
+#             for key, value in state_dict.items():
+#                 value = value.to(device if quantize is None else "cpu").to(dtype)
+#
+#                 layer_name = ".".join(key.split(".")[:4])
+#
+#                 # Fused qkv
+#                 if "q_proj" in key or "k_proj" in key or "v_proj" in key:
+#                     final_key = layer_name + ".query_key_value.weight"
+#
+#                 # Fused gate and up projs
+#                 elif "gate_proj" in key or "up_proj" in key:
+#                     final_key = layer_name + ".gate_up_proj.weight"
+#                 else:
+#                     final_key = key
+#
+#                 module_name, param_name = final_key.rsplit(".", 1)
+#                 module = model.get_submodule(module_name)
+#
+#                 try:
+#                     current_parameter_tensor = module._parameters[param_name]
+#                 except KeyError:
+#                     current_parameter_tensor = None
+#
+#                 if current_parameter_tensor is not None:
+#                     if current_parameter_tensor.device == torch.device("meta"):
+#                         # Init qkv
+#                         if "query_key_value" in final_key:
+#                             module._parameters[param_name] = value.new_empty(
+#                                 (value.shape[0] * 3, value.shape[1])
+#                             )
+#                         # Init gate and up proj
+#                         elif "gate_up_proj" in final_key:
+#                             module._parameters[param_name] = value.new_empty(
+#                                 (value.shape[0] * 2, value.shape[1])
+#                             )
+#
+#                     # Copy to correct slice
+#                     if "q_proj" in key:
+#                         module._parameters[param_name][: value.shape[0]] = value
+#                     elif "k_proj" in key:
+#                         module._parameters[param_name][
+#                             value.shape[0] : value.shape[0] * 2
+#                         ] = value
+#                     elif "v_proj" in key:
+#                         module._parameters[param_name][value.shape[0] * 2 :] = value
+#                     elif "gate_proj" in key:
+#                         module._parameters[param_name][: value.shape[0]] = value
+#                     elif "up_proj" in key:
+#                         module._parameters[param_name][value.shape[0] :] = value
+#                     else:
+#                         if current_parameter_tensor.shape != value.shape:
+#                             raise ValueError(
+#                                 f"Name {final_key} -- Current {current_parameter_tensor.shape} and got {value.shape}"
+#                             )
+#                         module._parameters[param_name] = value
+#                 else:
+#                     module._buffers[param_name] = value
+#
+#                 del value
+#
+#         torch.cuda.empty_cache()
+#         model.post_load_weights(quantize)
 
-        tokenizer = LlamaTokenizer.from_pretrained(
-            model_id,
-            revision=revision,
-            padding_side="left",
-            truncation_side="left",
-        )
 
-        config = AutoConfig.from_pretrained(
-            model_id,
-            revision=revision,
-        )
-
-        # We do not use from_pretrained as we modified the model internal module layout
-        try:
-            filenames = weight_files(model_id, revision, ".bin")
-        # Local files not found
-        except LocalEntryNotFoundError:
-            hub_files = weight_hub_files(model_id, revision, ".bin")
-            filenames = download_weights(hub_files, model_id, revision)
-
-        with init_empty_weights():
-            model = FlashLlamaForCausalLM(config)
-
-        self.load_weights(model, filenames, quantize, device, dtype)
-
-        super(FlashCausalLM, self).__init__(
-            model=model.to(device),
-            tokenizer=tokenizer,
-            requires_padding=False,
-            dtype=dtype,
-            device=device,
-        )
-
-    @staticmethod
-    def load_weights(
-        model,
-        filenames: List[Path],
-        quantize: Optional[str],
-        device: torch.device,
-        dtype: torch.dtype,
-    ):
+class Weights:
+    def __init__(self, filenames: List[Path], device, dtype):
+        routing = {}
         for filename in filenames:
-            state_dict = torch.load(filename, map_location="cpu")
-            for key, value in state_dict.items():
-                value = value.to(device if quantize is None else "cpu").to(dtype)
+            with safe_open(filename, framework="pytorch") as f:
+                for k in f.keys():
+                    if k in routing:
+                        raise RuntimeError(
+                            f"Key {k} was found in multiple files: {filename} and {routing[k]}"
+                        )
+                    routing[k] = filename
+        self.routing = routing
+        self.device = device
+        self.dtype = dtype
 
-                layer_name = ".".join(key.split(".")[:4])
-
-                # Fused qkv
-                if "q_proj" in key or "k_proj" in key or "v_proj" in key:
-                    final_key = layer_name + ".query_key_value.weight"
-
-                # Fused gate and up projs
-                elif "gate_proj" in key or "up_proj" in key:
-                    final_key = layer_name + ".gate_up_proj.weight"
-                else:
-                    final_key = key
-
-                module_name, param_name = final_key.rsplit(".", 1)
-                module = model.get_submodule(module_name)
-
-                try:
-                    current_parameter_tensor = module._parameters[param_name]
-                except KeyError:
-                    current_parameter_tensor = None
-
-                if current_parameter_tensor is not None:
-                    if current_parameter_tensor.device == torch.device("meta"):
-                        # Init qkv
-                        if "query_key_value" in final_key:
-                            module._parameters[param_name] = value.new_empty(
-                                (value.shape[0] * 3, value.shape[1])
-                            )
-                        # Init gate and up proj
-                        elif "gate_up_proj" in final_key:
-                            module._parameters[param_name] = value.new_empty(
-                                (value.shape[0] * 2, value.shape[1])
-                            )
-
-                    # Copy to correct slice
-                    if "q_proj" in key:
-                        module._parameters[param_name][: value.shape[0]] = value
-                    elif "k_proj" in key:
-                        module._parameters[param_name][
-                            value.shape[0] : value.shape[0] * 2
-                        ] = value
-                    elif "v_proj" in key:
-                        module._parameters[param_name][value.shape[0] * 2 :] = value
-                    elif "gate_proj" in key:
-                        module._parameters[param_name][: value.shape[0]] = value
-                    elif "up_proj" in key:
-                        module._parameters[param_name][value.shape[0] :] = value
-                    else:
-                        if current_parameter_tensor.shape != value.shape:
-                            raise ValueError(
-                                f"Name {final_key} -- Current {current_parameter_tensor.shape} and got {value.shape}"
-                            )
-                        module._parameters[param_name] = value
-                else:
-                    module._buffers[param_name] = value
-
-                del value
-
-        torch.cuda.empty_cache()
-        model.post_load_weights(quantize)
+    def get(self, name: str):
+        filename = self.routing.get(name, None)
+        if filename is None:
+            raise RuntimeError(f"weight {name} does not exist")
+        return filename
 
 
-class FlashLlamaSharded(FlashLlama):
+class FlashLlama(FlashLlamaForCausalLM):
     def __init__(
         self,
         model_id: str,
@@ -174,22 +196,24 @@ class FlashLlamaSharded(FlashLlama):
         )
 
         torch.distributed.barrier(group=self.process_group)
+
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
+        weights = Weights(filenames, device, dtype)
 
-        with init_empty_weights():
-            model = FlashLlamaForCausalLM(config, process_group=self.process_group)
+        config.quantize = quantize
+        model = FlashLlamaForCausalLM(config, weights, process_group=self.process_group)
 
         torch.distributed.barrier(group=self.process_group)
-        self.load_weights(
-            model,
-            filenames,
-            quantize=quantize,
-            device=device,
-            dtype=dtype,
-            rank=rank,
-            world_size=world_size,
-        )
-        torch.distributed.barrier(group=self.process_group)
+        # self.load_weights(
+        #     model,
+        #     filenames,
+        #     quantize=quantize,
+        #     device=device,
+        #     dtype=dtype,
+        #     rank=rank,
+        #     world_size=world_size,
+        # )
+        # torch.distributed.barrier(group=self.process_group)
         super(FlashCausalLM, self).__init__(
             model=model.to(device),
             tokenizer=tokenizer,
