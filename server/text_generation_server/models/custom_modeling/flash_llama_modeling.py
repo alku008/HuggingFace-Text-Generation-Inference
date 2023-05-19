@@ -109,6 +109,7 @@ class FlashLlamaAttention(torch.nn.Module):
 
         self.num_heads = self.num_heads // weights.process_group.size()
         self.query_key_value = TensorParallelColumnLinear.load_multi(
+            config,
             prefixes=[f"{prefix}.q_proj",
             f"{prefix}.k_proj",
             f"{prefix}.v_proj"],
@@ -117,6 +118,7 @@ class FlashLlamaAttention(torch.nn.Module):
             bias=False,
         )
         self.o_proj = TensorParallelRowLinear.load(
+            config,
             prefix=f"{prefix}.o_proj", weights=weights,
             bias=False,
         )
@@ -207,18 +209,20 @@ class LlamaMLP(nn.Module):
         )
         # Fuse gate and up proj
         self.gate_up_proj = TensorParallelColumnLinear.load_multi(
+            config,
             prefixes=[f"{prefix}.gate_proj", f"{prefix}.up_proj"],
             weights=weights,
             dim=0,
             bias=False,
         )
         self.down_proj = TensorParallelRowLinear.load(
+            config,
             prefix=f"{prefix}.down_proj",
             weights=weights,
             bias=False,
         )
         # TODO is this correct? It should give both are controlled by the same param
-        self.intermediate_size = self.gate_up_proj.weight.shape[1] // 2
+        self.intermediate_size = self.gate_up_proj.linear.weight.shape[1] // 2
 
     def forward(self, hidden_states):
         gate_up_states = self.gate_up_proj(hidden_states)
@@ -305,7 +309,7 @@ class FlashLlamaModel(torch.nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = LlamaRMSNorm(prefix="model", weights=weights, eps=config.rms_norm_eps)
+        self.norm = LlamaRMSNorm(prefix="model.norm", weights=weights, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
 
@@ -398,13 +402,14 @@ class FlashLlamaForCausalLM(torch.nn.Module):
 
         if self.model.tp_embeddings:
             self.lm_head = TensorParallelHead.load(
+                config,
                 prefix="lm_head",
                 weights=weights,
-                process_group=process_group,
                 bias=False,
             )
         else:
             self.lm_head = FastLinear.load(
+                config,
                 prefix="lm_head",
                 weights=weights,
                 bias=False,

@@ -9,14 +9,18 @@ class FakeBarrier:
 
 
 class FakeGroup:
+    def __init__(self, rank, size):
+        self._rank = rank
+        self._size = size
+
     def barrier(self, *args, **kwargs):
         return FakeBarrier()
 
     def size(self):
-        return 1
+        return self._size
 
     def rank(self):
-        return 0
+        return self._rank
 
 
 def initialize_torch_distributed():
@@ -39,8 +43,10 @@ def initialize_torch_distributed():
         options = None
 
     if world_size == 1:
-        return FakeGroup(), rank, world_size
+        return FakeGroup(rank, world_size), rank, world_size
     else:
+        if os.getenv("DEBUG", None) == "1":
+            return FakeGroup(rank, world_size), rank, world_size
         # Call the init process.
         torch.distributed.init_process_group(
             backend=backend,

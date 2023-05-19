@@ -17,73 +17,82 @@ class FastLinear(nn.Module):
         weight, bias,
         ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(weight)
-        self.bias = nn.Parameter(bias)
-
-    # def prepare_weights(self, quantize: Optional[str] = None):
-    #     if quantize == "bitsandbytes":
-    #         if not HAS_BITS_AND_BYTES:
-    #             raise ImportError(
-    #                 "bitsandbytes is not available on your machine either because it is not installed "
-    #                 "or you don't have a GPU.\n"
-    #                 "You can install it with `pip install bitsandbytes`."
-    #             )
-
-    #         self.quantized = True
-    #         self.bnb_linear = Linear8bitLt(
-    #             self.in_features,
-    #             self.out_features,
-    #             has_fp16_weights=False,
-    #             threshold=6.0,
-    #             bias=False,
-    #         )
-    #         # Copy data to bnb_linear
-    #         self.bnb_linear.weight.data = self.weight.data
-    #         if self.bias is not None:
-    #             self.bnb_linear.bias = nn.Parameter(self.bias)
-
-    #         # Delete reference to data
-    #         self.weight = None
-    #         self.bias = None
-    #     elif quantize == "gptq":
-    #         raise NotImplementedError("`gptq` is not implemented for now")
-    #     elif quantize is None:
-    #         self.weight = nn.Parameter(self.weight.T)
-    #     else:
-    #         raise ValueError(f"Unexpected quantize `{quantize}`")
+        self.weight = nn.Parameter(weight.T)
+        if bias:
+            self.bias = nn.Parameter(bias)
+        else:
+            self.bias = None
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # if self.quantized:
-        #     return self.bnb_linear(input)
-        # else:
         if self.bias is not None:
             return torch.addmm(self.bias, input, self.weight)
         return torch.matmul(input, self.weight)
 
 
-class TensorParallelHead(FastLinear):
+def get_linear(weight, bias, quantize):
+    if quantize is None:
+        linear = FastLinear(weight, bias)
+    elif quantize == "bitsandbytes":
+        out_features, in_features = weight.shape
+        linear = Linear8bitLt(
+            in_features,
+            out_features,
+            has_fp16_weights=False,
+            threshold=6.0,
+            bias=bias,
+        )
+        linear.weight = nn.Parameter(weight)
+        if bias:
+            linear.bias = nn.Parameter(bias)
+    elif quantize == "gptq":
+        raise NotImplementedError("Soon")
+    else:
+        raise NotImplementedError(f"Quantization `{config.quantize}` is not implemented yet.")
+    return linear
+
+
+class SuperLayer(nn.Module):
+    def __init__(self, linear):
+        super().__init__()
+        self.linear = linear
+
+    def forward(self, x):
+        return self.linear.forward(x)
+
+class TensorParallelHead(SuperLayer):
+    @staticmethod
+    def load(config, prefix: str, weights, bias: bool):
+        weight = weights.get_sharded(f"{prefix}.weight", dim=0) 
+        if bias:
+            bias = weights.get_sharded(f"{prefix}.bias", dim=0) 
+        else:
+            bias = None
+        model = TensorParallelHead(get_linear(weight, bias, config.quantize))
+        model.process_group = weights.process_group
+        model.world_size = weights.process_group.size()
+        return model
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         output = super().forward(input)
         # Logits are sharded, so we need to gather them
         world_output = [torch.empty_like(output) for _ in range(self.world_size)]
         torch.distributed.all_gather(world_output, output, group=self.process_group)
         world_output = torch.cat(world_output, dim=1)
-
         return world_output
 
 
-class TensorParallelColumnLinear(FastLinear):
+class TensorParallelColumnLinear(SuperLayer):
     @staticmethod
-    def load(prefix: str, weights, bias: bool):
+    def load(config, prefix: str, weights, bias: bool):
         weight = weights.get_sharded(f"{prefix}.weight", dim=0) 
         if bias:
             bias = weights.get_sharded(f"{prefix}.bias", dim=0) 
         else:
             bias = None
-        return TensorParallelColumnLinear(weight, bias)
+        return TensorParallelColumnLinear(get_linear(weight, bias, config.quantize))
 
     @staticmethod
-    def load_multi(prefixes: List[str], weights, bias: bool, dim: int):
+    def load_multi(config, prefixes: List[str], weights, bias: bool, dim: int):
         w = [weights.get_sharded(f"{p}.weight", dim=0) for p in prefixes]
         weight = torch.cat(w, dim=dim)
 
@@ -92,71 +101,26 @@ class TensorParallelColumnLinear(FastLinear):
             bias = torch.cat(b, dim=dim)
         else:
             bias = None
-        return TensorParallelColumnLinear(weight, bias)
+        return TensorParallelColumnLinear(get_linear(weight, bias, config.quantize))
 
 
-
-class TensorParallelRowLinear(FastLinear):
+class TensorParallelRowLinear(SuperLayer):
     @staticmethod
-    def load(prefix: str, weights, bias: bool):
+    def load(config, prefix: str, weights, bias: bool):
         weight = weights.get_sharded(f"{prefix}.weight", dim=1) 
         if bias:
             bias = weights.get_tensor(f"{prefix}.bias") 
         else:
             bias = None
-        return TensorParallelRowLinear(weight, bias)
+        layer =  TensorParallelRowLinear(get_linear(weight, bias, config.quantize))
+        layer.process_group = weights.process_group
+        return layer
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = super().forward(input)
         torch.distributed.all_reduce(out, group=self.process_group)
         return out
 
-
-# class TensorParallelEmbedding(nn.Embedding):
-#     def __init__(
-#         self,
-#         num_embeddings,
-#         embedding_dim,
-#         process_group: torch.distributed.ProcessGroup,
-#         reduce=True,
-#         padding_idx=None,
-#         max_norm=None,
-#         norm_type=2.0,
-#         scale_grad_by_freq=False,
-#         sparse=False,
-#         _weight=None,
-#         device=None,
-#         dtype=None,
-#     ):
-#         self.reduce = reduce
-#         self.process_group = process_group
-#         self.tp_rank = process_group.rank()
-#         self.tp_world_size = process_group.size()
-# 
-#         self.original_num_embeddings = num_embeddings
-# 
-#         assert num_embeddings % self.tp_world_size == 0
-#         block_size = num_embeddings // self.tp_world_size
-#         # inputs in `[min_id, max_id[` are handled by `self` to get embeddings
-#         self.min_id = self.tp_rank * block_size
-#         self.max_id = (self.tp_rank + 1) * block_size
-# 
-#         # Additional entry that will map to zero
-#         # Used for masking
-#         self.null_idx = block_size
-# 
-#         super().__init__(
-#             block_size,
-#             embedding_dim,
-#             padding_idx=padding_idx,
-#             max_norm=max_norm,
-#             norm_type=norm_type,
-#             scale_grad_by_freq=scale_grad_by_freq,
-#             sparse=sparse,
-#             _weight=_weight,
-#             device=device,
-#             dtype=dtype,
-#         )
 class TensorParallelEmbedding(nn.Module):
     def __init__(self, prefix: str, weights):
         super().__init__()
@@ -172,6 +136,8 @@ class TensorParallelEmbedding(nn.Module):
         assert num_embeddings % world_size == 0
         self.min_id = rank * block_size
         self.max_id = (rank + 1) * block_size
+        self.null_idx = block_size
+        self.process_group = weights.process_group
 
         """Additional 0 entry used for masking"""
         self.weight = nn.Parameter(F.pad(weight, (0, 0, 0, 1)))
