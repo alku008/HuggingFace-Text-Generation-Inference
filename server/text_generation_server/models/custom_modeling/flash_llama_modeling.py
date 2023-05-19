@@ -222,7 +222,7 @@ class LlamaMLP(nn.Module):
             bias=False,
         )
         # TODO is this correct? It should give both are controlled by the same param
-        self.intermediate_size = self.gate_up_proj.linear.weight.shape[1] // 2
+        self.intermediate_size = self.gate_up_proj.linear.out_features // 2
 
     def forward(self, hidden_states):
         gate_up_states = self.gate_up_proj(hidden_states)
