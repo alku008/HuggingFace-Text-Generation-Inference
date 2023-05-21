@@ -31,7 +31,6 @@ from typing import Optional
 import flash_attn_cuda
 
 from text_generation_server.utils.layers import (
-    FastLinear,
     TensorParallelRowLinear,
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
@@ -41,11 +40,12 @@ from text_generation_server.utils.layers import (
     get_linear,
 )
 
+
 def load_row(config, prefix: str, weights, bias: bool):
-    weight = weights.get_sharded(f"{prefix}.weight", dim=1) 
+    weight = weights.get_sharded(f"{prefix}.weight", dim=1)
     if bias and weights.process_group.rank() == 0:
         # Rank is only on the first rank process
-        bias = weights.get_tensor(f"{prefix}.bias") 
+        bias = weights.get_tensor(f"{prefix}.bias")
     else:
         bias = None
 
@@ -55,10 +55,11 @@ def load_row(config, prefix: str, weights, bias: bool):
     else:
         return TensorParallelColumnLinear(linear)
 
+
 def load_col(config, prefix: str, weights, bias: bool):
-    weight = weights.get_sharded(f"{prefix}.weight", dim=0) 
+    weight = weights.get_sharded(f"{prefix}.weight", dim=0)
     if bias:
-        bias = weights.get_sharded(f"{prefix}.bias", dim=0) 
+        bias = weights.get_sharded(f"{prefix}.bias", dim=0)
     else:
         bias = None
     linear = get_linear(weight, bias, config.quantize)
@@ -67,11 +68,9 @@ def load_col(config, prefix: str, weights, bias: bool):
     else:
         return TensorParallelRowLinear(linear)
 
+
 class FlashNeoxAttention(torch.nn.Module):
-    def __init__(
-        self,
-        config, prefix, weights
-    ):
+    def __init__(self, config, prefix, weights):
         super().__init__()
         num_heads = config.num_attention_heads
         hidden_size = config.hidden_size
@@ -88,10 +87,10 @@ class FlashNeoxAttention(torch.nn.Module):
         self.softmax_scale = self.head_size ** (-0.5)
 
         self.query_key_value = load_col(
-            config,prefix=f"{prefix}.query_key_value", weights=weights, bias=True
+            config, prefix=f"{prefix}.query_key_value", weights=weights, bias=True
         )
         self.dense = load_row(
-            config,prefix=f"{prefix}.dense", weights=weights, bias=True
+            config, prefix=f"{prefix}.dense", weights=weights, bias=True
         )
 
     def forward(
@@ -165,9 +164,7 @@ class FlashNeoxAttention(torch.nn.Module):
 
 
 class FlashMLP(nn.Module):
-    def __init__(
-        self, config, prefix, weights
-    ):
+    def __init__(self, config, prefix, weights):
         super().__init__()
         act = config.hidden_act
         self.act = (
@@ -182,7 +179,7 @@ class FlashMLP(nn.Module):
         )
 
         self.dense_h_to_4h = TensorParallelColumnLinear.load(
-                config, prefix=f"{prefix}.dense_h_to_4h", weights=weights, bias=True
+            config, prefix=f"{prefix}.dense_h_to_4h", weights=weights, bias=True
         )
         self.dense_4h_to_h = TensorParallelRowLinear.load(
             config, prefix=f"{prefix}.dense_4h_to_h", weights=weights, bias=True
@@ -196,49 +193,26 @@ class FlashMLP(nn.Module):
 
 
 class FlashNeoXLayer(nn.Module):
-    def __init__(
-        self,
-        layer_id,
-        config,
-        weights
-        # num_heads,
-        # act,
-        # hidden_size,
-        # intermediate_size,
-        # rotary_pct,
-        # rotary_emb_base,
-        # layer_norm_eps,
-        # use_parallel_residual,
-        # process_group=None,
-    ):
+    def __init__(self, layer_id, config, weights):
         super().__init__()
 
-        use_parallel_residual = config.use_parallel_residual
-        hidden_size = config.hidden_size
         layer_norm_eps = config.layer_norm_eps
 
         prefix = f"gpt_neox.layers.{layer_id}"
 
         self.use_parallel_residual = config.use_parallel_residual
-        self.input_layernorm = FastLayerNorm.load(prefix=f"{prefix}.input_layernorm", weights=weights, eps=layer_norm_eps)
-        self.post_attention_layernorm = FastLayerNorm.load(prefix=f"{prefix}.post_attention_layernorm", weights=weights, eps=layer_norm_eps)
+        self.input_layernorm = FastLayerNorm.load(
+            prefix=f"{prefix}.input_layernorm", weights=weights, eps=layer_norm_eps
+        )
+        self.post_attention_layernorm = FastLayerNorm.load(
+            prefix=f"{prefix}.post_attention_layernorm",
+            weights=weights,
+            eps=layer_norm_eps,
+        )
         self.attention = FlashNeoxAttention(
-                config, prefix=f"{prefix}.attention", weights=weights
-            # num_heads,
-            # hidden_size,
-            # rotary_pct,
-            # rotary_emb_base,
-            # process_group,
-            # reduce=not use_parallel_residual,
+            config, prefix=f"{prefix}.attention", weights=weights
         )
-        self.mlp = FlashMLP(
-                config, prefix=f"{prefix}.mlp", weights=weights
-            # act,
-            # hidden_size,
-            # intermediate_size,
-            # process_group,
-            # reduce=not use_parallel_residual,
-        )
+        self.mlp = FlashMLP(config, prefix=f"{prefix}.mlp", weights=weights)
         self.process_group = weights.process_group
 
     def forward(
@@ -318,15 +292,15 @@ class FlashGPTNeoXModel(FlashGPTNeoXPreTrainedModel):
 
         self.layers = nn.ModuleList(
             [
-                FlashNeoXLayer(
-                    layer_id,
-                    config,
-                    weights
-                )
+                FlashNeoXLayer(layer_id, config, weights)
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.final_layer_norm = FastLayerNorm.load(prefix="gpt_neox.final_layer_norm", weights=weights, eps=config.layer_norm_eps)
+        self.final_layer_norm = FastLayerNorm.load(
+            prefix="gpt_neox.final_layer_norm",
+            weights=weights,
+            eps=config.layer_norm_eps,
+        )
 
         self.gradient_checkpointing = False
 
@@ -404,7 +378,9 @@ class FlashGPTNeoXForCausalLM(FlashGPTNeoXPreTrainedModel):
         super().__init__(config)
         self.gpt_neox = FlashGPTNeoXModel(config, weights)
 
-        self.embed_out = TensorParallelHead.load(config, prefix="embed_out", weights=weights)
+        self.embed_out = TensorParallelHead.load(
+            config, prefix="embed_out", weights=weights
+        )
 
     def forward(
         self,

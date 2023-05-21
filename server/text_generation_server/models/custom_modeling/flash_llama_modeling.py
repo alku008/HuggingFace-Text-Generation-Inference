@@ -30,7 +30,6 @@ import flash_attn_cuda
 import dropout_layer_norm
 
 from text_generation_server.utils.layers import (
-    FastLinear,
     TensorParallelRowLinear,
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
@@ -110,16 +109,15 @@ class FlashLlamaAttention(torch.nn.Module):
         self.num_heads = self.num_heads // weights.process_group.size()
         self.query_key_value = TensorParallelColumnLinear.load_multi(
             config,
-            prefixes=[f"{prefix}.q_proj",
-            f"{prefix}.k_proj",
-            f"{prefix}.v_proj"],
+            prefixes=[f"{prefix}.q_proj", f"{prefix}.k_proj", f"{prefix}.v_proj"],
             dim=0,
             weights=weights,
             bias=False,
         )
         self.o_proj = TensorParallelRowLinear.load(
             config,
-            prefix=f"{prefix}.o_proj", weights=weights,
+            prefix=f"{prefix}.o_proj",
+            weights=weights,
             bias=False,
         )
 
@@ -221,7 +219,9 @@ class LlamaMLP(nn.Module):
             weights=weights,
             bias=False,
         )
-        self.intermediate_size = config.intermediate_size // weights.process_group.size()
+        self.intermediate_size = (
+            config.intermediate_size // weights.process_group.size()
+        )
 
     def forward(self, hidden_states):
         gate_up_states = self.gate_up_proj(hidden_states)
@@ -233,11 +233,19 @@ class FlashLlamaLayer(nn.Module):
     def __init__(self, layer_id, config, weights):
         super().__init__()
         prefix = f"model.layers.{layer_id}"
-        self.self_attn = FlashLlamaAttention(prefix=f"{prefix}.self_attn", config=config, weights=weights)
+        self.self_attn = FlashLlamaAttention(
+            prefix=f"{prefix}.self_attn", config=config, weights=weights
+        )
         self.mlp = LlamaMLP(prefix=f"{prefix}.mlp", config=config, weights=weights)
 
-        self.input_layernorm = LlamaRMSNorm(prefix=f"{prefix}.input_layernorm", weights=weights, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(prefix=f"{prefix}.post_attention_layernorm", weights=weights, eps=config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(
+            prefix=f"{prefix}.input_layernorm", weights=weights, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = LlamaRMSNorm(
+            prefix=f"{prefix}.post_attention_layernorm",
+            weights=weights,
+            eps=config.rms_norm_eps,
+        )
 
     def forward(
         self,
@@ -309,7 +317,9 @@ class FlashLlamaModel(torch.nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = LlamaRMSNorm(prefix="model.norm", weights=weights, eps=config.rms_norm_eps)
+        self.norm = LlamaRMSNorm(
+            prefix="model.norm", weights=weights, eps=config.rms_norm_eps
+        )
 
         self.gradient_checkpointing = False
 

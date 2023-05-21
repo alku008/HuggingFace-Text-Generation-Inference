@@ -1,22 +1,17 @@
 import torch
 import torch.distributed
 
-from typing import List, Optional, Type
+from typing import Optional, Type
 
-from accelerate import init_empty_weights
-from safetensors import safe_open
 from transformers import (
     AutoTokenizer,
     AutoConfig,
     PreTrainedTokenizerBase,
 )
-from transformers.models.bloom.parallel_layers import (
-    TensorParallelColumnLinear,
-    TensorParallelEmbedding,
-    TensorParallelRowLinear,
-)
 
-from text_generation_server.models.custom_modeling.bloom_modeling import BloomForCausalLM
+from text_generation_server.models.custom_modeling.bloom_modeling import (
+    BloomForCausalLM,
+)
 from text_generation_server.models import CausalLM
 from text_generation_server.models.causal_lm import CausalLMBatch
 from text_generation_server.pb import generate_pb2
@@ -28,9 +23,8 @@ from text_generation_server.utils import (
 
 HAS_BITS_AND_BYTES = True
 try:
-    import bitsandbytes as bnb
-    from bitsandbytes.nn import Int8Params
-except Exception as e:
+    pass
+except Exception:
     HAS_BITS_AND_BYTES = False
 
 
@@ -42,9 +36,7 @@ class BloomCausalLMBatch(CausalLMBatch):
         tokenizer: PreTrainedTokenizerBase,
         device: torch.device,
     ) -> "CausalLMBatch":
-        batch = super().from_pb(
-            pb=pb, tokenizer=tokenizer, device=device
-        )
+        batch = super().from_pb(pb=pb, tokenizer=tokenizer, device=device)
         batch.keys_head_dim_last = False
         return batch
 
@@ -72,11 +64,13 @@ class BLOOMSharded(CausalLM):
             model_id, revision=revision, slow_but_exact=False, tp_parallel=True
         )
         config.pad_token_id = 3
-        config.quantize=quantize
+        config.quantize = quantize
 
         torch.distributed.barrier(group=self.process_group)
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(filenames, device=device, dtype=dtype, process_group=self.process_group)
+        weights = Weights(
+            filenames, device=device, dtype=dtype, process_group=self.process_group
+        )
 
         model = BloomForCausalLM(config, weights)
 

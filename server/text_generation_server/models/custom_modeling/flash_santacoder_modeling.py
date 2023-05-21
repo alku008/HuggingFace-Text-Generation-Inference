@@ -8,7 +8,6 @@ from typing import Optional, List
 # Flash attention imports
 import flash_attn_cuda
 from text_generation_server.utils.layers import (
-    FastLinear,
     TensorParallelRowLinear,
     TensorParallelColumnLinear,
     TensorParallelHead,
@@ -17,55 +16,70 @@ from text_generation_server.utils.layers import (
     get_linear,
 )
 
+
 def load_multi_mqa(config, prefixes: List[str], weights, bias: bool):
     if config.transpose:
-        w = [weights.get_sharded(f"{p}.weight", dim=1).T if i == 0 else weights.get_tensor(f"{p}.weight").T for i, p in enumerate(prefixes)]
+        w = [
+            weights.get_sharded(f"{p}.weight", dim=1).T
+            if i == 0
+            else weights.get_tensor(f"{p}.weight").T
+            for i, p in enumerate(prefixes)
+        ]
         weight = torch.cat(w, dim=0)
     else:
-        w = [weights.get_sharded(f"{p}.weight", dim=0) if i == 0 else weights.get_tensor(f"{p}.weight") for i, p in enumerate(prefixes)]
+        w = [
+            weights.get_sharded(f"{p}.weight", dim=0)
+            if i == 0
+            else weights.get_tensor(f"{p}.weight")
+            for i, p in enumerate(prefixes)
+        ]
         weight = torch.cat(w, dim=1)
 
     if bias:
-        b = [weights.get_sharded(f"{p}.bias", dim=0) if i == 0 else weights.get_tensor(f"{p}.bias") for i, p in enumerate(prefixes)]
+        b = [
+            weights.get_sharded(f"{p}.bias", dim=0)
+            if i == 0
+            else weights.get_tensor(f"{p}.bias")
+            for i, p in enumerate(prefixes)
+        ]
         bias = torch.cat(b, dim=0)
     else:
         bias = None
 
     return TensorParallelColumnLinear(get_linear(weight, bias, config.quantize))
 
+
 def load_col(config, prefix: str, weights, bias: bool):
     if config.transpose:
-        weight = weights.get_sharded(f"{prefix}.weight", dim=1).T 
+        weight = weights.get_sharded(f"{prefix}.weight", dim=1).T
     else:
-        weight = weights.get_sharded(f"{prefix}.weight", dim=0) 
+        weight = weights.get_sharded(f"{prefix}.weight", dim=0)
 
     if bias:
-        bias = weights.get_sharded(f"{prefix}.bias", dim=0) 
+        bias = weights.get_sharded(f"{prefix}.bias", dim=0)
     else:
         bias = None
     return TensorParallelColumnLinear(get_linear(weight, bias, config.quantize))
+
 
 def load_row(config, prefix: str, weights, bias: bool):
     if config.transpose:
         weight = weights.get_sharded(f"{prefix}.weight", dim=0).T
     else:
-        weight = weights.get_sharded(f"{prefix}.weight", dim=1) 
+        weight = weights.get_sharded(f"{prefix}.weight", dim=1)
 
     if bias and weights.process_group.rank() == 0:
         # Rank is only on the first rank process
-        bias = weights.get_tensor(f"{prefix}.bias") 
+        bias = weights.get_tensor(f"{prefix}.bias")
     else:
         bias = None
-    layer =  TensorParallelRowLinear(get_linear(weight, bias, config.quantize))
+    layer = TensorParallelRowLinear(get_linear(weight, bias, config.quantize))
     layer.process_group = weights.process_group
     return layer
 
 
 class FlashMQAttention(torch.nn.Module):
-    def __init__(
-        self,
-        prefix, config, weights
-    ):
+    def __init__(self, prefix, config, weights):
         super().__init__()
         num_heads = config.num_attention_heads
         hidden_size = config.hidden_size
@@ -77,13 +91,14 @@ class FlashMQAttention(torch.nn.Module):
 
         self.softmax_scale = self.head_size ** (-0.5)
 
-        process_group = weights.process_group
-        self.c_attn = load_multi_mqa(config, prefixes=[f"{prefix}.q_attn", f"{prefix}.kv_attn"], bias=True, weights=weights)
-        self.c_proj = load_row(
+        self.c_attn = load_multi_mqa(
             config,
-            prefix=f"{prefix}.c_proj",
+            prefixes=[f"{prefix}.q_attn", f"{prefix}.kv_attn"],
+            bias=True,
             weights=weights,
-            bias=True
+        )
+        self.c_proj = load_row(
+            config, prefix=f"{prefix}.c_proj", weights=weights, bias=True
         )
 
     def forward(
@@ -194,14 +209,15 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(
-        self,
-        layer_id, config, weights
-    ):
+    def __init__(self, layer_id, config, weights):
         super().__init__()
         prefix = f"transformer.h.{layer_id}"
-        self.ln_1 = FastLayerNorm.load(prefix=f"{prefix}.ln_1", weights=weights, eps=config.layer_norm_epsilon)
-        self.ln_2 = FastLayerNorm.load(prefix=f"{prefix}.ln_2", weights=weights, eps=config.layer_norm_epsilon)
+        self.ln_1 = FastLayerNorm.load(
+            prefix=f"{prefix}.ln_1", weights=weights, eps=config.layer_norm_epsilon
+        )
+        self.ln_2 = FastLayerNorm.load(
+            prefix=f"{prefix}.ln_2", weights=weights, eps=config.layer_norm_epsilon
+        )
         self.attn = FlashMQAttention(
             prefix=f"{prefix}.attn",
             config=config,
@@ -251,11 +267,13 @@ class FlashSantacoderModel(nn.Module):
         self.tp_rank = process_group.rank()
         self.tp_world_size = process_group.size()
         self.wte = TensorParallelEmbedding(
-            prefix="transformer.wte", weights=weights,
+            prefix="transformer.wte",
+            weights=weights,
             reduce=False,
         )
         self.wpe = TensorParallelEmbedding(
-            prefix="transformer.wpe", weights=weights,
+            prefix="transformer.wpe",
+            weights=weights,
             reduce=False,
         )
         self.tp_embeddings = True
@@ -263,12 +281,16 @@ class FlashSantacoderModel(nn.Module):
         self.h = nn.ModuleList(
             [
                 Block(
-                    layer_id, config, weights,
+                    layer_id,
+                    config,
+                    weights,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.ln_f = FastLayerNorm.load(prefix="transformer.ln_f", weights=weights, eps=config.layer_norm_epsilon)
+        self.ln_f = FastLayerNorm.load(
+            prefix="transformer.ln_f", weights=weights, eps=config.layer_norm_epsilon
+        )
 
         self.head_size = self.h[0].attn.head_size
         self.num_heads = self.h[0].attn.num_heads
@@ -337,7 +359,9 @@ class FlashSantacoderForCausalLM(nn.Module):
     def __init__(self, config, weights):
         super().__init__()
         self.transformer = FlashSantacoderModel(config, weights)
-        self.lm_head = TensorParallelHead.load(config, prefix="transformer.wte", weights=weights)
+        self.lm_head = TensorParallelHead.load(
+            config, prefix="transformer.wte", weights=weights
+        )
 
     def forward(
         self,

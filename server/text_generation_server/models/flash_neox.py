@@ -1,23 +1,18 @@
 import torch
 import torch.distributed
 
-from accelerate import init_empty_weights
 from opentelemetry import trace
-from safetensors import safe_open
 from transformers import AutoTokenizer, AutoConfig
-from typing import Optional, List
+from typing import Optional
 
 from text_generation_server.models import FlashCausalLM
 from text_generation_server.models.custom_modeling.flash_neox_modeling import (
     FlashGPTNeoXForCausalLM,
-    TensorParallelEmbedding,
-    TensorParallelRowLinear,
-    TensorParallelColumnLinear,
 )
 from text_generation_server.utils import (
     initialize_torch_distributed,
     weight_files,
-    Weights
+    Weights,
 )
 
 tracer = trace.get_tracer(__name__)
@@ -49,7 +44,9 @@ class FlashNeoXSharded(FlashCausalLM):
 
         torch.distributed.barrier(group=self.process_group)
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(filenames, device=device, dtype=dtype, process_group=self.process_group)
+        weights = Weights(
+            filenames, device=device, dtype=dtype, process_group=self.process_group
+        )
 
         model = FlashGPTNeoXForCausalLM(config, weights)
 

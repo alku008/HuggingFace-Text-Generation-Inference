@@ -97,7 +97,7 @@ def get_model(
         if sharded:
             if not FLASH_ATTENTION:
                 raise NotImplementedError(
-                    FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Santacoder")
+                    FLASH_ATT_ERROR_MESSAGE.format("Sharded Santacoder")
                 )
             return FlashSantacoderSharded(model_id, revision, quantize=quantize)
         else:
@@ -111,7 +111,7 @@ def get_model(
             return FlashSantacoderSharded(model_id, revision, quantize=quantize)
         elif sharded:
             raise NotImplementedError(
-                FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Santacoder")
+                FLASH_ATT_ERROR_MESSAGE.format("Sharded Santacoder")
             )
         else:
             return SantaCoder(model_id, revision, quantize=quantize)
@@ -131,7 +131,7 @@ def get_model(
         if FLASH_ATTENTION:
             return FlashLlama(model_id, revision, quantize=quantize)
         elif sharded:
-            raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Llama"))
+            raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format("Sharded Llama"))
         else:
             return CausalLM(model_id, revision, quantize=quantize)
 

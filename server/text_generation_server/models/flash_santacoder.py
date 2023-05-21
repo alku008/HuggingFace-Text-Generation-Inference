@@ -1,30 +1,22 @@
 import torch
 import torch.distributed
 
-from accelerate import init_empty_weights
 from opentelemetry import trace
-from safetensors import safe_open
-from pathlib import Path
 from transformers import AutoTokenizer, GPT2Config
 from typing import Optional, List
 
 from text_generation_server.models import FlashCausalLM
 from text_generation_server.models.custom_modeling.flash_santacoder_modeling import (
     FlashSantacoderForCausalLM,
-    TensorParallelRowLinear,
-    TensorParallelColumnLinear,
-    TensorParallelEmbedding,
 )
 from text_generation_server.utils import (
     initialize_torch_distributed,
     weight_files,
-    download_weights,
-    weight_hub_files,
-    LocalEntryNotFoundError,
     Weights,
 )
 
 tracer = trace.get_tracer(__name__)
+
 
 class FlashSantacoderSharded(FlashCausalLM):
     def __init__(
@@ -49,11 +41,13 @@ class FlashSantacoderSharded(FlashCausalLM):
             revision=revision,
         )
         config.quantize = quantize
-        config.transpose=config.architectures[0].startswith("GPT2")
+        config.transpose = config.architectures[0].startswith("GPT2")
 
         torch.distributed.barrier(group=self.process_group)
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(filenames, device=device, dtype=dtype, process_group=self.process_group)
+        weights = Weights(
+            filenames, device=device, dtype=dtype, process_group=self.process_group
+        )
 
         model = FlashSantacoderForCausalLM(config, weights)
 
@@ -73,4 +67,3 @@ class FlashSantacoderSharded(FlashCausalLM):
         return self.tokenizer.decode(
             generated_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
         )
-
