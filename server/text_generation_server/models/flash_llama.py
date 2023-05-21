@@ -56,7 +56,7 @@ class FlashLlama(FlashCausalLM):
         weights = Weights(filenames, device, dtype, process_group=self.process_group)
 
         config.quantize = quantize
-        model = FlashLlamaForCausalLM(config, weights, process_group=self.process_group)
+        model = FlashLlamaForCausalLM(config, weights)
 
         torch.distributed.barrier(group=self.process_group)
         super(FlashCausalLM, self).__init__(

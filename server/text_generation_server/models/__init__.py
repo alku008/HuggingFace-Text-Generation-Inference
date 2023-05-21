@@ -8,7 +8,7 @@ from typing import Optional
 from text_generation_server.models.model import Model
 from text_generation_server.models.causal_lm import CausalLM
 from text_generation_server.models.flash_causal_lm import FlashCausalLM
-from text_generation_server.models.bloom import BLOOM, BLOOMSharded
+from text_generation_server.models.bloom import BLOOMSharded
 from text_generation_server.models.seq2seq_lm import Seq2SeqLM
 from text_generation_server.models.opt import OPT, OPTSharded
 from text_generation_server.models.galactica import Galactica, GalacticaSharded
@@ -49,7 +49,6 @@ except ImportError:
 
 __all__ = [
     "Model",
-    "BLOOM",
     "BLOOMSharded",
     "CausalLM",
     "FlashCausalLM",
@@ -123,10 +122,7 @@ def get_model(
             return santacoder_cls(model_id, revision, quantize=quantize)
 
     if model_type == "bloom":
-        if sharded:
-            return BLOOMSharded(model_id, revision, quantize=quantize)
-        else:
-            return BLOOM(model_id, revision, quantize=quantize)
+        return BLOOMSharded(model_id, revision, quantize=quantize)
 
     if model_type == "gpt_neox":
         if sharded:
@@ -137,9 +133,9 @@ def get_model(
             return neox_cls(model_id, revision, quantize=quantize)
 
     if model_type == "llama":
-        if sharded:
-            if FLASH_ATTENTION:
-                return FlashLlama(model_id, revision, quantize=quantize)
+        if FLASH_ATTENTION:
+            return FlashLlama(model_id, revision, quantize=quantize)
+        elif sharded:
             raise NotImplementedError(FLASH_ATT_ERROR_MESSAGE.format(f"Sharded Llama"))
         else:
             llama_cls = FlashLlama if FLASH_ATTENTION else CausalLM

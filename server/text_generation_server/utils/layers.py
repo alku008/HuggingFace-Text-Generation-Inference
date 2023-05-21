@@ -1,6 +1,7 @@
 import torch
 
 from torch import nn
+from loguru import logger
 from torch.nn import functional as F
 from typing import Optional, List
 
@@ -12,6 +13,23 @@ try:
 except ImportError as e:
     HAS_BITS_AND_BYTES = False
 
+from accelerate import init_empty_weights
+
+
+# Monkey patching
+@staticmethod
+def load_layer_norm(prefix, weights, eps):
+    weight = weights.get_tensor(f"{prefix}.weight")
+    bias = weights.get_tensor(f"{prefix}.bias")
+    with init_empty_weights():
+        ln = torch.nn.LayerNorm(weight.shape, eps=eps)
+
+    ln.weight = nn.Parameter(weight)
+    ln.bias = nn.Parameter(bias)
+    return ln
+
+torch.nn.LayerNorm.load = load_layer_norm
+
 
 class FastLinear(nn.Module):
     def __init__(
@@ -20,16 +38,20 @@ class FastLinear(nn.Module):
         ) -> None:
         super().__init__()
         self.weight = nn.Parameter(weight.T)
-        if bias:
+        if bias is not None:
             self.bias = nn.Parameter(bias)
         else:
             self.bias = None
-        self.out_features = weight.shape[0]
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        prefix_shape = input.shape[:-1]
+        input = input.view(-1, input.shape[-1])
         if self.bias is not None:
-            return torch.addmm(self.bias, input, self.weight)
-        return torch.matmul(input, self.weight)
+            out = torch.addmm(self.bias, input, self.weight)
+        else:
+            out = torch.matmul(input, self.weight)
+        out = out.view(*prefix_shape, -1)
+        return out
 
 
 class Linear8bitLt(nn.Module):
@@ -41,7 +63,6 @@ class Linear8bitLt(nn.Module):
         self.index = index
 
         # Necessary for stacked layers
-        self.out_features = weight.shape[0]
         self.state.threshold = threshold
         self.state.has_fp16_weights = has_fp16_weights
         self.state.memory_efficient_backward = memory_efficient_backward
@@ -87,7 +108,7 @@ def get_linear(weight, bias, quantize):
             has_fp16_weights=False,
             threshold=6.0,
         )
-        if bias:
+        if bias is not None:
             linear.bias = nn.Parameter(bias)
     elif quantize == "gptq":
         raise NotImplementedError("Soon")
@@ -199,6 +220,15 @@ class TensorParallelEmbedding(nn.Module):
         # TODO self.reduce
         torch.distributed.all_reduce(out, group=self.process_group)
         return out
+
+class Embedding(nn.Module):
+    def __init__(self, prefix: str, weights):
+        super().__init__()
+        weight = weights.get_tensor(f"{prefix}.weight") 
+        self.weight = nn.Parameter(weight)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.embedding(input, self.weight)
 
 
 try:

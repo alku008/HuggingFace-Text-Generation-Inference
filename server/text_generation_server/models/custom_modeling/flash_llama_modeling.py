@@ -221,8 +221,7 @@ class LlamaMLP(nn.Module):
             weights=weights,
             bias=False,
         )
-        # TODO is this correct? It should give both are controlled by the same param
-        self.intermediate_size = self.gate_up_proj.linear.out_features // 2
+        self.intermediate_size = config.intermediate_size // weights.process_group.size()
 
     def forward(self, hidden_states):
         gate_up_states = self.gate_up_proj(hidden_states)
@@ -277,11 +276,12 @@ class FlashLlamaLayer(nn.Module):
 
 
 class FlashLlamaModel(torch.nn.Module):
-    def __init__(self, config, weights, process_group):
+    def __init__(self, config, weights):
         super().__init__()
         self.config = config
 
         self.tp_embeddings = False
+        process_group = weights.process_group
         self.tp_rank = process_group.rank()
         self.tp_world_size = process_group.size()
         if config.vocab_size % self.tp_world_size == 0:
@@ -292,7 +292,7 @@ class FlashLlamaModel(torch.nn.Module):
                 prefix="model.embed_tokens", weights=weights
             )
         else:
-            self.embed_tokens = Embedding(prefix="model.embed_tokens", process_group=process_group)
+            self.embed_tokens = Embedding(prefix="model.embed_tokens", weights=weights)
 
         self.layers = nn.ModuleList(
             [
@@ -383,12 +383,10 @@ class FlashLlamaModel(torch.nn.Module):
 
 
 class FlashLlamaForCausalLM(torch.nn.Module):
-    def __init__(self, config, weights, process_group):
+    def __init__(self, config, weights):
         super().__init__()
 
-        self.process_group = process_group
-        self.world_size = self.process_group.size()
-        self.model = FlashLlamaModel(config, weights, process_group)
+        self.model = FlashLlamaModel(config, weights)
 
         if self.model.tp_embeddings:
             self.lm_head = TensorParallelHead.load(
