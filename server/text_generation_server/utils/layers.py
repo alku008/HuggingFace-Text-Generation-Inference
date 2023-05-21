@@ -16,12 +16,12 @@ from accelerate import init_empty_weights
 
 
 # Monkey patching
-@staticmethod
-def load_layer_norm(prefix, weights, eps):
+@classmethod
+def load_layer_norm(cls, prefix, weights, eps):
     weight = weights.get_tensor(f"{prefix}.weight")
     bias = weights.get_tensor(f"{prefix}.bias")
     with init_empty_weights():
-        ln = torch.nn.LayerNorm(weight.shape, eps=eps)
+        ln = cls(weight.shape, eps=eps)
 
     ln.weight = nn.Parameter(weight)
     ln.bias = nn.Parameter(bias)
@@ -36,7 +36,6 @@ class FastLinear(nn.Module):
         weight, bias,
         ) -> None:
         super().__init__()
-        # self.weight = nn.Parameter(weight.T)
         self.weight = nn.Parameter(weight)
         if bias is not None:
             self.bias = nn.Parameter(bias)
@@ -171,7 +170,7 @@ class TensorParallelColumnLinear(SuperLayer):
 
         if bias:
             b = [weights.get_sharded(f"{p}.bias", dim=0) for p in prefixes]
-            bias = torch.cat(b, dim=dim)
+            bias = torch.cat(b, dim=0)
         else:
             bias = None
         return TensorParallelColumnLinear(get_linear(weight, bias, config.quantize))
@@ -191,7 +190,6 @@ class TensorParallelRowLinear(SuperLayer):
             bias = None
         layer =  TensorParallelRowLinear(get_linear(weight, bias, config.quantize))
         layer.process_group = weights.process_group
-        layer.prefix = prefix
         return layer
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -200,7 +198,7 @@ class TensorParallelRowLinear(SuperLayer):
         return out
 
 class TensorParallelEmbedding(nn.Module):
-    def __init__(self, prefix: str, weights):
+    def __init__(self, prefix: str, weights, reduce=True):
         super().__init__()
         weight = weights.get_sharded(f"{prefix}.weight", dim=0) 
         num_embeddings = weights.get_shape(f"{prefix}.weight")[0]
@@ -216,6 +214,7 @@ class TensorParallelEmbedding(nn.Module):
         self.max_id = (rank + 1) * block_size
         self.null_idx = block_size
         self.process_group = weights.process_group
+        self.reduce = reduce
 
         """Additional 0 entry used for masking"""
         self.weight = nn.Parameter(F.pad(weight, (0, 0, 0, 1)))
@@ -229,18 +228,9 @@ class TensorParallelEmbedding(nn.Module):
             input - self.min_id,
         )
         out = torch.nn.functional.embedding(input, self.weight)
-        # TODO self.reduce
-        torch.distributed.all_reduce(out, group=self.process_group)
+        if self.reduce:
+            torch.distributed.all_reduce(out, group=self.process_group)
         return out
-
-class Embedding(nn.Module):
-    def __init__(self, prefix: str, weights):
-        super().__init__()
-        weight = weights.get_tensor(f"{prefix}.weight") 
-        self.weight = nn.Parameter(weight)
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.embedding(input, self.weight)
 
 
 try:
