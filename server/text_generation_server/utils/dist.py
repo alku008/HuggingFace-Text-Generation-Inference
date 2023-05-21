@@ -13,6 +13,12 @@ class FakeGroup:
         self._rank = rank
         self._size = size
 
+    def allreduce(self, *args, **kwargs):
+        return FakeBarrier()
+
+    def allgather(self, *args, **kwargs):
+        return FakeBarrier()
+
     def barrier(self, *args, **kwargs):
         return FakeBarrier()
 

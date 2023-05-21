@@ -25,6 +25,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
 from torch.nn import functional as F
+from loguru import logger
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -485,25 +486,6 @@ class BloomPreTrainedModel(PreTrainedModel):
     base_model_prefix = "transformer"
     _no_split_modules = ["BloomBlock"]
 
-    def __init__(self, *inputs, **kwargs):
-        super().__init__(*inputs, **kwargs)
-
-    def _init_weights(self, module: nn.Module):
-        """Initialize the weights."""
-        if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
     @staticmethod
     def _convert_to_standard_cache(
             past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]], batch_size: int
@@ -806,7 +788,6 @@ class BloomForCausalLM(BloomPreTrainedModel):
                 config,
                 prefix="word_embeddings",
                 weights=weights,
-                bias=False,
             )
         else:
             self.lm_head = FastLinear.load(
@@ -815,12 +796,7 @@ class BloomForCausalLM(BloomPreTrainedModel):
                 weights=weights,
                 bias=False,
             )
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings: torch.Tensor):
-        self.lm_head = new_embeddings
+        self.post_init()
 
     def prepare_inputs_for_generation(
             self,
@@ -899,20 +875,9 @@ class BloomForCausalLM(BloomPreTrainedModel):
         hidden_states = transformer_outputs[0]
 
         lm_logits = self.lm_head(hidden_states)
+        logger.info(f"lm_logits {lm_logits.view(-1)[:5]}..{lm_logits.view(-1)[-5:]}")
 
         loss = None
-        if labels is not None:
-            # move labels to correct device to enable model parallelism
-            labels = labels.to(lm_logits.device)
-            # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            batch_size, seq_length, vocab_size = shift_logits.shape
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(
-                shift_logits.view(batch_size * seq_length, vocab_size), shift_labels.view(batch_size * seq_length)
-            )
 
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]

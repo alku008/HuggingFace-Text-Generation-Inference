@@ -17,6 +17,15 @@ class Weights:
         self.device = device
         self.dtype = dtype
         self.process_group = process_group
+        self._handles = {}
+
+    def _get_handle(self, filename):
+        if filename not in self._handles:
+            f = safe_open(filename, framework="pytorch")
+            self._handles[filename] = f
+
+        return self._handles[filename]
+
 
 
     def get_filename(self, tensor_name: str) -> str:
@@ -27,14 +36,14 @@ class Weights:
 
     def get_shape(self, tensor_name: str):
         filename = self.get_filename(tensor_name)
-        with safe_open(filename, framework="pytorch") as f:
-            slice_ = f.get_slice(tensor_name)
-            return slice_.get_shape()
+        f = self._get_handle(filename)
+        slice_ = f.get_slice(tensor_name)
+        return slice_.get_shape()
 
     def get_tensor(self, tensor_name: str):
         filename = self.get_filename(tensor_name)
-        with safe_open(filename, framework="pytorch") as f:
-            tensor = f.get_tensor(tensor_name)
+        f = self._get_handle(filename)
+        tensor = f.get_tensor(tensor_name)
         tensor = tensor.to(dtype=self.dtype)
         tensor = tensor.to(device=self.device)
         return tensor
@@ -44,19 +53,19 @@ class Weights:
         world_size = self.process_group.size()
         rank = self.process_group.rank()
 
-        with safe_open(filename, framework="pytorch") as f:
-            slice_ = f.get_slice(tensor_name)
-            size = slice_.get_shape()[dim]
-            block_size = size // world_size
-            start = rank * block_size
-            stop = (rank + 1) * block_size
+        f = self._get_handle(filename)
+        slice_ = f.get_slice(tensor_name)
+        size = slice_.get_shape()[dim]
+        block_size = size // world_size
+        start = rank * block_size
+        stop = (rank + 1) * block_size
 
-            if dim == 0:
-                tensor = slice_[start:stop]
-            elif dim == 1:
-                tensor = slice_[:, start:stop]
-            else:
-                raise NotImplementedError("Let's make that generic when needed")
+        if dim == 0:
+            tensor = slice_[start:stop]
+        elif dim == 1:
+            tensor = slice_[:, start:stop]
+        else:
+            raise NotImplementedError("Let's make that generic when needed")
         tensor = tensor.to(dtype=self.dtype)
         tensor = tensor.to(device=self.device)
         return tensor

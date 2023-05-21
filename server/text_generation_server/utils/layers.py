@@ -37,21 +37,32 @@ class FastLinear(nn.Module):
         weight, bias,
         ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(weight.T)
+        self.weight = nn.Parameter(weight)
         if bias is not None:
             self.bias = nn.Parameter(bias)
         else:
             self.bias = None
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        prefix_shape = input.shape[:-1]
-        input = input.view(-1, input.shape[-1])
-        if self.bias is not None:
-            out = torch.addmm(self.bias, input, self.weight)
+    @staticmethod
+    def load(config, prefix: str, weights, bias: bool):
+        weight = weights.get_tensor(f"{prefix}.weight") 
+        if bias:
+            bias = weights.get_tensor(f"{prefix}.bias") 
         else:
-            out = torch.matmul(input, self.weight)
-        out = out.view(*prefix_shape, -1)
-        return out
+            bias = None
+        return FastLinear(weight, bias)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.linear(input, self.weight, self.bias)
+        # TODO Is this faster ?
+        # prefix_shape = input.shape[:-1]
+        # input = input.view(-1, input.shape[-1])
+        # if self.bias is not None:
+        #     out = torch.addmm(self.bias, input, self.weight)
+        # else:
+        #     out = torch.matmul(input, self.weight)
+        # out = out.view(*prefix_shape, -1)
+        # return out
 
 
 class Linear8bitLt(nn.Module):
@@ -127,13 +138,9 @@ class SuperLayer(nn.Module):
 
 class TensorParallelHead(SuperLayer):
     @staticmethod
-    def load(config, prefix: str, weights, bias: bool):
+    def load(config, prefix: str, weights):
         weight = weights.get_sharded(f"{prefix}.weight", dim=0) 
-        if bias:
-            bias = weights.get_sharded(f"{prefix}.bias", dim=0) 
-        else:
-            bias = None
-        model = TensorParallelHead(get_linear(weight, bias, config.quantize))
+        model = TensorParallelHead(get_linear(weight, bias=None, quantize=config.quantize))
         model.process_group = weights.process_group
         model.world_size = weights.process_group.size()
         return model
@@ -174,17 +181,21 @@ class TensorParallelRowLinear(SuperLayer):
     @staticmethod
     def load(config, prefix: str, weights, bias: bool):
         weight = weights.get_sharded(f"{prefix}.weight", dim=1) 
-        if bias:
+        if bias and weights.process_group.rank() == 0:
+            # Rank is only on the first rank process
             bias = weights.get_tensor(f"{prefix}.bias") 
         else:
             bias = None
         layer =  TensorParallelRowLinear(get_linear(weight, bias, config.quantize))
         layer.process_group = weights.process_group
+        layer.prefix = prefix
         return layer
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = super().forward(input)
         torch.distributed.all_reduce(out, group=self.process_group)
+        if self.process_group.rank() == 0 and ".0."  in self.prefix:
+            logger.info(f"out {self.prefix} {out.view(-1)[:5]}")
         return out
 
 class TensorParallelEmbedding(nn.Module):
@@ -219,6 +230,8 @@ class TensorParallelEmbedding(nn.Module):
         out = torch.nn.functional.embedding(input, self.weight)
         # TODO self.reduce
         torch.distributed.all_reduce(out, group=self.process_group)
+        if self.process_group.rank() == 0:
+            logger.info(f"out {out.view(-1)[:5]}")
         return out
 
 class Embedding(nn.Module):

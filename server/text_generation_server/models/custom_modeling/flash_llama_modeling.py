@@ -393,7 +393,6 @@ class FlashLlamaForCausalLM(torch.nn.Module):
                 config,
                 prefix="lm_head",
                 weights=weights,
-                bias=False,
             )
         else:
             self.lm_head = FastLinear.load(
