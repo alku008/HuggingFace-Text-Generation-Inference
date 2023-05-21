@@ -387,20 +387,11 @@ class FlashLlamaForCausalLM(torch.nn.Module):
         super().__init__()
 
         self.model = FlashLlamaModel(config, weights)
-
-        if self.model.tp_embeddings:
-            self.lm_head = TensorParallelHead.load(
-                config,
-                prefix="lm_head",
-                weights=weights,
-            )
-        else:
-            self.lm_head = FastLinear.load(
-                config,
-                prefix="lm_head",
-                weights=weights,
-                bias=False,
-            )
+        self.lm_head = TensorParallelHead.load(
+            config,
+            prefix="lm_head",
+            weights=weights,
+        )
 
     def forward(
         self,

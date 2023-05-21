@@ -1,7 +1,6 @@
 import torch
 
 from torch import nn
-from loguru import logger
 from torch.nn import functional as F
 from typing import Optional, List
 
@@ -37,6 +36,7 @@ class FastLinear(nn.Module):
         weight, bias,
         ) -> None:
         super().__init__()
+        # self.weight = nn.Parameter(weight.T)
         self.weight = nn.Parameter(weight)
         if bias is not None:
             self.bias = nn.Parameter(bias)
@@ -140,17 +140,17 @@ class TensorParallelHead(SuperLayer):
     @staticmethod
     def load(config, prefix: str, weights):
         weight = weights.get_sharded(f"{prefix}.weight", dim=0) 
-        model = TensorParallelHead(get_linear(weight, bias=None, quantize=config.quantize))
-        model.process_group = weights.process_group
-        model.world_size = weights.process_group.size()
-        return model
+
+        head = TensorParallelHead(get_linear(weight, bias=None, quantize=config.quantize))
+        head.process_group = weights.process_group
+        return head
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         output = super().forward(input)
         # Logits are sharded, so we need to gather them
-        world_output = [torch.empty_like(output) for _ in range(self.world_size)]
+        world_output = [torch.empty_like(output) for _ in range(self.process_group.size())]
         torch.distributed.all_gather(world_output, output, group=self.process_group)
-        world_output = torch.cat(world_output, dim=1)
+        world_output = torch.cat(world_output, dim=-1)
         return world_output
 
 
@@ -181,9 +181,12 @@ class TensorParallelRowLinear(SuperLayer):
     @staticmethod
     def load(config, prefix: str, weights, bias: bool):
         weight = weights.get_sharded(f"{prefix}.weight", dim=1) 
-        if bias and weights.process_group.rank() == 0:
-            # Rank is only on the first rank process
-            bias = weights.get_tensor(f"{prefix}.bias") 
+        if bias:
+            if weights.process_group.rank() == 0:
+                # Rank is only on the first rank process
+                bias = weights.get_tensor(f"{prefix}.bias") 
+            else:
+                bias = torch.zeros_like(weights.get_tensor(f"{prefix}.bias"))
         else:
             bias = None
         layer =  TensorParallelRowLinear(get_linear(weight, bias, config.quantize))
@@ -194,8 +197,6 @@ class TensorParallelRowLinear(SuperLayer):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = super().forward(input)
         torch.distributed.all_reduce(out, group=self.process_group)
-        if self.process_group.rank() == 0 and ".0."  in self.prefix:
-            logger.info(f"out {self.prefix} {out.view(-1)[:5]}")
         return out
 
 class TensorParallelEmbedding(nn.Module):
@@ -230,8 +231,6 @@ class TensorParallelEmbedding(nn.Module):
         out = torch.nn.functional.embedding(input, self.weight)
         # TODO self.reduce
         torch.distributed.all_reduce(out, group=self.process_group)
-        if self.process_group.rank() == 0:
-            logger.info(f"out {out.view(-1)[:5]}")
         return out
 
 class Embedding(nn.Module):
