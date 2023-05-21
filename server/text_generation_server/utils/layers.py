@@ -180,12 +180,9 @@ class TensorParallelRowLinear(SuperLayer):
     @staticmethod
     def load(config, prefix: str, weights, bias: bool):
         weight = weights.get_sharded(f"{prefix}.weight", dim=1) 
-        if bias:
-            if weights.process_group.rank() == 0:
-                # Rank is only on the first rank process
-                bias = weights.get_tensor(f"{prefix}.bias") 
-            else:
-                bias = torch.zeros_like(weights.get_tensor(f"{prefix}.bias"))
+        if bias and weights.process_group.rank() == 0:
+            # Rank is only on the first rank process
+            bias = weights.get_tensor(f"{prefix}.bias") 
         else:
             bias = None
         layer =  TensorParallelRowLinear(get_linear(weight, bias, config.quantize))

@@ -29,7 +29,7 @@ try:
                 f"GPU with CUDA capability {major} {minor} is not supported"
             )
 
-        from text_generation_server.models.flash_neox import FlashNeoX, FlashNeoXSharded
+        from text_generation_server.models.flash_neox import FlashNeoXSharded
         from text_generation_server.models.flash_llama import (
             FlashLlama,
         )
@@ -63,7 +63,6 @@ __all__ = [
 ]
 
 if FLASH_ATTENTION:
-    __all__.append(FlashNeoX)
     __all__.append(FlashNeoXSharded)
     __all__.append(FlashSantacoderSharded)
     __all__.append(FlashLlama)
