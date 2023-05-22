@@ -12,22 +12,12 @@ from transformers import (
 )
 
 from text_generation_server.models import Seq2SeqLM
+from text_generation_server.models.custom_modeling.t5_modeling import T5ForConditionalGeneration
 from text_generation_server.utils import (
     initialize_torch_distributed,
     weight_files,
+    Weights
 )
-from transformers.models.t5.parallel_layers import (
-    TensorParallelRowLinear,
-    TensorParallelColumnLinear,
-    TensorParallelEmbedding,
-)
-
-HAS_BITS_AND_BYTES = True
-try:
-    import bitsandbytes as bnb
-    from bitsandbytes.nn import Int8Params
-except ImportError:
-    HAS_BITS_AND_BYTES = False
 
 
 class T5Sharded(Seq2SeqLM):
@@ -45,31 +35,25 @@ class T5Sharded(Seq2SeqLM):
             device = torch.device("cpu")
             dtype = torch.float32
 
+        config = AutoConfig.from_pretrained(
+            model_id, revision=revision
+        )
+        config.quantize = quantize
+
         tokenizer = AutoTokenizer.from_pretrained(
             model_id, revision=revision, padding_side="left", truncation_side="left"
         )
-
-        config = AutoConfig.from_pretrained(
-            model_id, revision=revision, tp_parallel=True
-        )
         tokenizer.bos_token_id = config.decoder_start_token_id
+
 
         torch.distributed.barrier(group=self.process_group)
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-
-        with init_empty_weights():
-            model = AutoModelForSeq2SeqLM.from_config(config)
-
-        torch.distributed.barrier(group=self.process_group)
-        self.load_weights(
-            model,
-            filenames,
-            quantize=quantize,
-            device=device,
-            dtype=dtype,
-            rank=rank,
-            world_size=world_size,
+        weights = Weights(
+            filenames, device=device, dtype=dtype, process_group=self.process_group
         )
+
+        model = T5ForConditionalGeneration(config, weights)
+
         torch.distributed.barrier(group=self.process_group)
         super(Seq2SeqLM, self).__init__(
             model=model,
@@ -245,13 +229,8 @@ class T5Sharded(Seq2SeqLM):
             use_cache=True,
         )
 
-        # Logits are sharded, so we need to gather them
-        logits = [torch.empty_like(outputs.logits) for _ in range(self.world_size)]
-        torch.distributed.all_gather(logits, outputs.logits, group=self.process_group)
-        logits = torch.cat(logits, dim=2)
-
         return (
-            logits,
+            outputs.logits,
             outputs.encoder_last_hidden_state,
             outputs.past_key_values,
         )

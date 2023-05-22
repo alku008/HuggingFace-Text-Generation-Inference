@@ -229,6 +229,15 @@ class TensorParallelEmbedding(nn.Module):
             torch.distributed.all_reduce(out, group=self.process_group)
         return out
 
+class Embedding(nn.Module):
+    def __init__(self, prefix: str, weights, reduce=True):
+        super().__init__()
+        weight = weights.get_tensor(f"{prefix}.weight") 
+        self.weight = nn.Parameter(weight)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.embedding(input, self.weight)
+
 
 try:
     import dropout_layer_norm
